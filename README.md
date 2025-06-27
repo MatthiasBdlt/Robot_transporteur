@@ -47,9 +47,9 @@ Le projet contient les modules/fonctions suivants :
 
 ## 🧭 Exemple de Grille (3x3)
 
-C1 C2 C3 /n
-B1 B2 B3 /n
-A1 A2 A3 /n
+C1 C2 C3  
+B1 B2 B3  
+A1 A2 A3  
 
 
 Les tags NFC sont disposés aux intersections, et permettent au robot de se repérer en temps réel.
