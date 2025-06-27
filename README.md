@@ -77,7 +77,7 @@ Les tags NFC sont disposés aux intersections, et permettent au robot de se rep�
 
 ## 🧠 Crédits
 
-Projet conçu et codé par [Matthias BIDAULT].  
+Projet conçu et codé par Matthias BIDAULT.  
 Basé sur Raspberry Pi Pico + CircuitPython avec bibliothèque **Adafruit PN532**.
 
 ---
