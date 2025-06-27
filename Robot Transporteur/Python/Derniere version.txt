@@ -1,0 +1,257 @@
+import time
+import board
+import busio
+from digitalio import DigitalInOut, Direction
+from pwmio import PWMOut
+from adafruit_pn532.i2c import PN532_I2C
+import wifi
+import socketpool
+
+# --- Moteurs ---
+M1_IN1 = PWMOut(board.GP18)
+M1_IN2 = PWMOut(board.GP19)  # Avant gauche
+M2_IN1 = PWMOut(board.GP20)
+M2_IN2 = PWMOut(board.GP21)  # Arrière gauche
+M3_IN1 = PWMOut(board.GP6)
+M3_IN2 = PWMOut(board.GP7)   # Arrière droit
+M4_IN1 = PWMOut(board.GP8)
+M4_IN2 = PWMOut(board.GP9)   # Avant droit
+
+VITESSE = 20000
+VITESSE_TOURNE = 20000
+VITESSE_CORRECTION = 15000
+
+# --- Capteurs IR ---
+CAPTEUR_GAUCHE = DigitalInOut(board.GP10)
+CAPTEUR_GAUCHE.direction = Direction.INPUT
+CAPTEUR_MILIEU = DigitalInOut(board.GP11)
+CAPTEUR_MILIEU.direction = Direction.INPUT
+CAPTEUR_DROIT = DigitalInOut(board.GP12)
+CAPTEUR_DROIT.direction = Direction.INPUT
+
+DETECTE = True
+NON_DETECTE = False
+
+# --- NFC ---
+i2c = busio.I2C(scl=board.GP5, sda=board.GP4)
+nfc = PN532_I2C(i2c, debug=False)
+nfc.SAM_configuration()
+
+# --- Variables ---
+nfc_en_cours = False
+dernier_etat_capteurs = -1
+attend_commande = False  # Nouveau : robot attend instruction web
+
+# --- Fonctions moteurs ---
+def duty_pwm(pwm_out, value):
+    pwm_out.duty_cycle = value
+
+def stop_all():
+    for moteur in [M1_IN1, M1_IN2, M2_IN1, M2_IN2, M3_IN1, M3_IN2, M4_IN1, M4_IN2]:
+        duty_pwm(moteur, 0)
+
+def avancer():
+    duty_pwm(M1_IN1, VITESSE)
+    duty_pwm(M1_IN2, 0)
+    duty_pwm(M2_IN1, 0)
+    duty_pwm(M2_IN2, VITESSE)
+    duty_pwm(M3_IN1, 0)
+    duty_pwm(M3_IN2, VITESSE)
+    duty_pwm(M4_IN1, 0)
+    duty_pwm(M4_IN2, VITESSE)
+
+def corriger_droite_lent():
+    duty_pwm(M1_IN1, VITESSE)
+    duty_pwm(M1_IN2, 0)
+    duty_pwm(M2_IN1, 0)
+    duty_pwm(M2_IN2, VITESSE)
+    duty_pwm(M3_IN1, VITESSE_CORRECTION)
+    duty_pwm(M3_IN2, 0)
+    duty_pwm(M4_IN1, VITESSE_CORRECTION)
+    duty_pwm(M4_IN2, 0)
+
+def corriger_gauche_lent():
+    duty_pwm(M1_IN1, 0)
+    duty_pwm(M1_IN2, VITESSE_CORRECTION)
+    duty_pwm(M2_IN1, VITESSE_CORRECTION)
+    duty_pwm(M2_IN2, 0)
+    duty_pwm(M3_IN1, 0)
+    duty_pwm(M3_IN2, VITESSE)
+    duty_pwm(M4_IN1, 0)
+    duty_pwm(M4_IN2, VITESSE)
+
+def tourne_gauche():
+    duty_pwm(M1_IN1, 0)
+    duty_pwm(M1_IN2, VITESSE_TOURNE)
+    duty_pwm(M2_IN1, 0)
+    duty_pwm(M2_IN2, 0)
+    duty_pwm(M3_IN1, 0)
+    duty_pwm(M3_IN2, VITESSE_TOURNE)
+    duty_pwm(M4_IN1, 0)
+    duty_pwm(M4_IN2, VITESSE_TOURNE)
+
+    time.sleep(0.2)
+
+    while (CAPTEUR_GAUCHE.value == NON_DETECTE and
+           CAPTEUR_MILIEU.value == NON_DETECTE and
+           CAPTEUR_DROIT.value == NON_DETECTE):
+        time.sleep(0.01)
+
+    stop_all()
+
+
+    
+def tourne_droite():
+    duty_pwm(M1_IN1, 0)
+    duty_pwm(M1_IN2, VITESSE_TOURNE)
+    duty_pwm(M2_IN1, 0)
+    duty_pwm(M2_IN2, 0)
+    duty_pwm(M3_IN1, 0)
+    duty_pwm(M3_IN2, VITESSE_TOURNE)
+    duty_pwm(M4_IN1, VITESSE_TOURNE)
+    duty_pwm(M4_IN2, 0)
+
+    time.sleep(0.2)  # petit délai avant détection pour éviter fausse détection
+
+    while (CAPTEUR_GAUCHE.value == NON_DETECTE and
+           CAPTEUR_MILIEU.value == NON_DETECTE and
+           CAPTEUR_DROIT.value == NON_DETECTE):
+        time.sleep(0.01)
+
+    stop_all()
+
+
+
+def impulsion():
+    duty_pwm(M1_IN1, VITESSE_TOURNE)
+    duty_pwm(M1_IN2, 0)
+    duty_pwm(M2_IN1, 0)
+    duty_pwm(M2_IN2, VITESSE_TOURNE)
+    duty_pwm(M3_IN1, 0)
+    duty_pwm(M3_IN2, VITESSE_TOURNE)
+    duty_pwm(M4_IN1, 0)
+    duty_pwm(M4_IN2, VITESSE_TOURNE)
+
+# --- Fonction NFC modifiée ---
+def lire_nfc():
+    global nfc_en_cours, attend_commande
+    if nfc_en_cours:
+        return
+    nfc_en_cours = True
+    uid = nfc.read_passive_target(timeout=0.05)
+    if uid:
+        print("[NFC] Tag détecté. UID:", [hex(i) for i in uid])
+        stop_all()
+        attend_commande = True
+    nfc_en_cours = False
+
+# --- Suivi ligne ---
+def suivi_ligne():
+    global dernier_etat_capteurs
+    cap_g = CAPTEUR_GAUCHE.value
+    cap_m = CAPTEUR_MILIEU.value
+    cap_d = CAPTEUR_DROIT.value
+    pattern = (cap_g << 2) | (cap_m << 1) | cap_d
+
+    if pattern != dernier_etat_capteurs:
+        print(f"[CAPTEURS] Pattern: {bin(pattern)} → ", end='')
+        if pattern == 0b010:
+            print("AVANCE")
+            avancer()
+        elif pattern in [0b001, 0b011]:
+            print("CORRECTION GAUCHE")
+            corriger_gauche_lent()
+        elif pattern in [0b100, 0b110]:
+            print("CORRECTION DROITE")
+            corriger_droite_lent()
+        elif pattern == 0b111:
+            print("INTERSECTION")
+            avancer()
+        elif pattern == 0b000:
+            print("PLUS DE LIGNE - STOP")
+            stop_all()
+        else:
+            print("ÉTAT INCONNU")
+        dernier_etat_capteurs = pattern
+
+# --- Wi-Fi point d'accès ---
+ssid = "PicoAP"
+password = "12345678"
+
+print("Démarrage point d'accès Wi-Fi...")
+wifi.radio.start_ap(ssid=ssid, password=password)
+time.sleep(5)
+print("Point d'accès actif:", ssid)
+print("Adresse IP supposée:", "192.168.4.1")
+
+pool = socketpool.SocketPool(wifi.radio)
+server = pool.socket(pool.AF_INET, pool.SOCK_STREAM)
+server.bind(("0.0.0.0", 80))
+server.listen(1)
+server.settimeout(0.1)
+
+print("Serveur HTTP démarré")
+
+# --- Boucle principale ---
+while True:
+    if not attend_commande:
+        suivi_ligne()
+        lire_nfc()
+    else:
+        print("En attente d'une commande via la page web...")
+
+    try:
+        client_sock, client_addr = server.accept()
+        print("Connexion de", client_addr)
+
+        buffer = bytearray(1024)
+        received = client_sock.recv_into(buffer)
+        request = buffer[:received].decode("utf-8")
+        print("Requête HTTP reçue:")
+        print(request)
+
+        # Chercher action GET dans URL (ex: GET /?action=left HTTP/1.1)
+        action = None
+        if "GET /?action=left" in request:
+            action = "left"
+        elif "GET /?action=right" in request:
+            action = "right"
+
+        if attend_commande and action:
+            if action == "left":
+                print("Commande reçue : tourner à gauche")
+                tourne_gauche()
+            elif action == "right":
+                print("Commande reçue : tourner à droite")
+                tourne_droite()
+            attend_commande = False
+            avancer()
+
+        # Page web avec boutons gauche/droite
+        response = f"""\
+HTTP/1.1 200 OK
+
+<!DOCTYPE html>
+<html>
+<head><title>Commande Robot</title></head>
+<body>
+<h1>Commande Robot</h1>
+<p>Robot en attente de commande : {attend_commande}</p>
+<form>
+  <button type="submit" name="action" value="left">Tourner à gauche</button>
+  <button type="submit" name="action" value="right">Tourner à droite</button>
+</form>
+</body>
+</html>
+"""
+        client_sock.send(response.encode("utf-8"))
+        client_sock.close()
+
+    except OSError:
+        # Timeout sans connexion, on continue
+        pass
+    except Exception as e:
+        print("Erreur lors de la gestion du client:", e)
+
+    time.sleep(0.01)
+

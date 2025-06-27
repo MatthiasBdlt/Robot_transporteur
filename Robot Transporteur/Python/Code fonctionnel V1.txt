@@ -1,0 +1,222 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_PN532.h>
+
+// --- Configuration NFC ---
+#define PN532_IRQ -1
+#define PN532_RESET -1
+Adafruit_PN532 nfc(PN532_IRQ, PN532_RESET);
+
+// --- Déclaration des broches moteurs ---
+const int M1_IN1 = 18; const int M1_IN2 = 19; // Moteur avant gauche
+const int M2_IN1 = 20; const int M2_IN2 = 21; // Moteur arrière gauche
+const int M3_IN1 = 6;  const int M3_IN2 = 7;  // Moteur arrière droit
+const int M4_IN1 = 8;  const int M4_IN2 = 9;  // Moteur avant droit
+
+// --- Vitesses moteurs ---
+const int VITESSE = 80;             // Augmenté pour meilleure réactivité
+const int VITESSE_CORRECTION = 65;   // Augmenté proportionnellement
+
+// --- Déclaration des capteurs IR ---
+const int BROCHE_CAPTEUR_GAUCHE = 10;
+const int BROCHE_CAPTEUR_MILIEU = 11;
+const int BROCHE_CAPTEUR_DROIT  = 12;
+
+// --- États logiques des capteurs ---
+const int DETECTE = 1;       // Noir détecté (ligne)
+const int NON_DETECTE = 0;   // Blanc (pas de ligne)
+
+// --- Variables de contrôle ---
+bool nfcInitialise = false;
+unsigned long derniereLectureNFC = 0;
+const unsigned long INTERVALLE_NFC = 2000;    // Réduit à 2 secondes
+int dernierEtatCapteurs = -1;
+bool debugMode = true;
+bool nfcEnCours = false;
+unsigned long dernierChangementEtat = 0;
+const unsigned long DELAI_RECUPERATION = 500;  // Délai avant arrêt si ligne perdue
+unsigned long derniereMesure = 0;
+const unsigned long INTERVALLE_MESURE = 10;    // Intervalle minimum entre mesures
+
+void initialiser_moteurs() {
+
+    pinMode(M1_IN1, OUTPUT); pinMode(M1_IN2, OUTPUT);
+    pinMode(M2_IN1, OUTPUT); pinMode(M2_IN2, OUTPUT);
+    pinMode(M3_IN1, OUTPUT); pinMode(M3_IN2, OUTPUT);
+    pinMode(M4_IN1, OUTPUT); pinMode(M4_IN2, OUTPUT);
+    
+    // Assurer que tous les moteurs sont arrêtés au démarrage
+    analogWrite(M1_IN1, 0); analogWrite(M1_IN2, 0);
+    analogWrite(M2_IN1, 0); analogWrite(M2_IN2, 0);
+    analogWrite(M3_IN1, 0); analogWrite(M3_IN2, 0);
+    analogWrite(M4_IN1, 0); analogWrite(M4_IN2, 0);
+}
+
+void initialiser_capteurs() {
+    pinMode(BROCHE_CAPTEUR_GAUCHE, INPUT);
+    pinMode(BROCHE_CAPTEUR_MILIEU, INPUT);
+    pinMode(BROCHE_CAPTEUR_DROIT, INPUT);
+}
+
+void initialiser_nfc() {
+    Wire.begin();
+    nfc.begin();
+    
+    uint32_t versiondata = nfc.getFirmwareVersion();
+    if (!versiondata) {
+        if (Serial) Serial.println("[INIT] PN532 non détecté - Mode ligne seule");
+        nfcInitialise = false;
+        return;
+    }
+    
+    nfc.SAMConfig();
+    if (Serial) Serial.println("[INIT] PN532 prêt");
+    nfcInitialise = true;
+}
+
+// --- Fonctions moteurs optimisées ---
+void arreter() {
+    analogWrite(M1_IN1, 0); analogWrite(M1_IN2, 0);
+    analogWrite(M2_IN1, 0); analogWrite(M2_IN2, 0);
+    analogWrite(M3_IN1, 0); analogWrite(M3_IN2, 0);
+    analogWrite(M4_IN1, 0); analogWrite(M4_IN2, 0);
+}
+
+void avancerToutDroit() {
+    analogWrite(M1_IN1, VITESSE); analogWrite(M1_IN2, 0);
+    analogWrite(M2_IN1, 0);       analogWrite(M2_IN2, VITESSE);
+    analogWrite(M3_IN1, 0);       analogWrite(M3_IN2, VITESSE);
+    analogWrite(M4_IN1, 0);       analogWrite(M4_IN2, VITESSE);
+}
+
+void corrigerDroiteLent() {
+    analogWrite(M1_IN1, VITESSE);            analogWrite(M1_IN2, 0);
+    analogWrite(M2_IN1, 0);                  analogWrite(M2_IN2, VITESSE);
+    analogWrite(M3_IN1, VITESSE_CORRECTION); analogWrite(M3_IN2, 0);
+    analogWrite(M4_IN1, VITESSE_CORRECTION); analogWrite(M4_IN2, 0);
+}
+
+void corrigerGaucheLent() {
+    analogWrite(M1_IN1, 0);                  analogWrite(M1_IN2, VITESSE_CORRECTION);
+    analogWrite(M2_IN1, VITESSE_CORRECTION); analogWrite(M2_IN2, 0);
+    analogWrite(M3_IN1, 0);                  analogWrite(M3_IN2, VITESSE);
+    analogWrite(M4_IN1, 0);                  analogWrite(M4_IN2, VITESSE);
+}
+
+// --- Fonction NFC optimisée ---
+void lireNFC() {
+    if (!nfcInitialise || nfcEnCours) return;
+    
+    nfcEnCours = true;
+    uint8_t uid[7];
+    uint8_t uidLength;
+    
+    if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 50)) { // Timeout réduit
+        if (Serial) {
+            Serial.print("[NFC] Tag: ");
+            for (uint8_t i = 0; i < uidLength; i++) {
+                if (uid[i] < 0x10) Serial.print("0");
+                Serial.print(uid[i], HEX);
+                Serial.print(" ");
+            }
+            Serial.println();
+        }
+        
+        uint8_t blockNumber = 4;
+        uint8_t keya[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+        
+        if (nfc.mifareclassic_AuthenticateBlock(uid, uidLength, blockNumber, 0, keya)) {
+            uint8_t data[16];
+            if (nfc.mifareclassic_ReadDataBlock(blockNumber, data)) {
+                if (Serial) {
+                    Serial.print("[NFC] Zone: ");
+                    Serial.print((char)data[0]);
+                    Serial.println((char)data[1]);
+                }
+            }
+        }
+    }
+    
+    nfcEnCours = false;
+}
+
+// --- Fonction de suivi de ligne améliorée ---
+void suiviLigne() {
+    unsigned long maintenant = millis();
+    if (maintenant - derniereMesure < INTERVALLE_MESURE) return;
+    derniereMesure = maintenant;
+    
+    int capteurGauche = digitalRead(BROCHE_CAPTEUR_GAUCHE);
+    int capteurMilieu = digitalRead(BROCHE_CAPTEUR_MILIEU);
+    int capteurDroit  = digitalRead(BROCHE_CAPTEUR_DROIT);
+    
+    int etatActuel = capteurGauche * 4 + capteurMilieu * 2 + capteurDroit;
+    
+    if (etatActuel != dernierEtatCapteurs) {
+        dernierChangementEtat = maintenant;
+        
+        if (Serial && debugMode) {
+            Serial.print("[CAPTEURS] G:"); Serial.print(capteurGauche);
+            Serial.print(" M:"); Serial.print(capteurMilieu);
+            Serial.print(" D:"); Serial.print(capteurDroit);
+            Serial.print(" → ");
+        }
+    }
+    
+    // Logique de suivi améliorée
+    if (capteurGauche == NON_DETECTE && capteurMilieu == DETECTE && capteurDroit == NON_DETECTE) {
+        if (etatActuel != dernierEtatCapteurs && Serial) Serial.println("AVANCE");
+        avancerToutDroit();
+    }
+    else if ((capteurGauche == NON_DETECTE && capteurDroit == DETECTE) || 
+             (capteurMilieu == DETECTE && capteurDroit == DETECTE)) {
+        if (etatActuel != dernierEtatCapteurs && Serial) Serial.println("CORRECTION GAUCHE");
+        corrigerGaucheLent();
+    }
+    else if ((capteurGauche == DETECTE && capteurDroit == NON_DETECTE) || 
+             (capteurGauche == DETECTE && capteurMilieu == DETECTE)) {
+        if (etatActuel != dernierEtatCapteurs && Serial) Serial.println("CORRECTION DROITE");
+        corrigerDroiteLent();
+    }
+    else if (capteurGauche == NON_DETECTE && capteurMilieu == NON_DETECTE && capteurDroit == NON_DETECTE) {
+        if (maintenant - dernierChangementEtat > DELAI_RECUPERATION) {
+            if (etatActuel != dernierEtatCapteurs && Serial) Serial.println("ARRÊT - LIGNE PERDUE");
+            arreter();
+        } else {
+            if (etatActuel != dernierEtatCapteurs && Serial) Serial.println("RECHERCHE LIGNE");
+            avancerToutDroit();
+        }
+    }
+    else {
+        if (etatActuel != dernierEtatCapteurs && Serial) Serial.println("ARRÊT SÉCURITÉ");
+        arreter();
+    }
+    
+    dernierEtatCapteurs = etatActuel;
+}
+
+void setup() {
+    Serial.begin(115200);
+    
+    initialiser_moteurs();
+    initialiser_capteurs();
+    delay(50);  // Court délai de stabilisation
+    initialiser_nfc();
+    
+    if (Serial) {
+        Serial.println("[INIT] Système démarré");
+        Serial.println("[INIT] Suivi de ligne + NFC actifs");
+    }
+}
+
+void loop() {
+    suiviLigne();  // Priorité au suivi de ligne
+    
+    unsigned long maintenant = millis();
+    if (maintenant - derniereLectureNFC >= INTERVALLE_NFC) {
+        lireNFC();
+        derniereLectureNFC = maintenant;
+    }
+    
+    delay(10);  // Délai minimal pour stabilité
+}
